@@ -6,20 +6,18 @@
 #include <Preferences.h>
 #include "webpage.h"
 
-#define PIN_RELAY      26     
+#define PIN_RELAY      26      
 #define PIN_LED        2       
 
 #define RELAY_ACTIVE_LOW   true
 
-const char* AP_SSID = "Penyiraman";
-const char* AP_PASS = "12345678";
-
+const char* AP_SSID = "Automatic Watering";
+const char* AP_PASS = "12345678";        
 
 AsyncWebServer server(80);
 RTC_DS3231 rtc;
 Preferences prefs;
 bool rtcOk = false;
-
 
 struct Settings {
   uint8_t  startHour       = 10;
@@ -28,7 +26,6 @@ struct Settings {
   uint8_t  endMinute       = 0;
   uint16_t sprayDurationSec= 900;   
   uint16_t restDurationSec = 900;   
-  bool     autoEnabled     = true;
 } cfg;
 
 enum ManualMode { MODE_AUTO, MODE_MAN_ON, MODE_MAN_OFF };
@@ -51,10 +48,8 @@ void loadSettings(){
   cfg.endMinute        = prefs.getUChar("eM", cfg.endMinute);
   cfg.sprayDurationSec = prefs.getUShort("spr", cfg.sprayDurationSec);
   cfg.restDurationSec  = prefs.getUShort("rst", cfg.restDurationSec);
-  cfg.autoEnabled      = prefs.getBool("auto", cfg.autoEnabled);
   prefs.end();
 }
-
 void saveSettings(){
   prefs.begin("siram", false);
   prefs.putUChar("sH", cfg.startHour);
@@ -63,7 +58,6 @@ void saveSettings(){
   prefs.putUChar("eM", cfg.endMinute);
   prefs.putUShort("spr", cfg.sprayDurationSec);
   prefs.putUShort("rst", cfg.restDurationSec);
-  prefs.putBool("auto", cfg.autoEnabled);
   prefs.end();
 }
 
@@ -106,13 +100,6 @@ bool isWithinWindow(const DateTime& now){
   return (n >= s || n < e);              
 }
 
-long secondsToStart(const DateTime& now){
-  int s = minutesOfDay(cfg.startHour, cfg.startMinute);
-  int n = minutesOfDay(now.hour(), now.minute());
-  int diff = (s - n + 1440) % 1440;
-  return (long)diff*60 - now.second();
-}
-
 long countdownSec = 0;
 String countdownLabel = "";
 
@@ -129,15 +116,12 @@ void updateLogic(){
   else if (manualMode == MODE_MAN_OFF){
     desired = false; stateLabel = "MANUAL OFF";
   }
-  else { // ---- AUTO ----
-    if (!cfg.autoEnabled){
-      desired = false; stateLabel = "AUTO NONAKTIF";
-    }
-    else if (!inWindow){
+  else { 
+    if (!inWindow){
       desired = false; stateLabel = "DI LUAR JADWAL";
-      if (rtcOk){ countdownLabel = "Mulai dalam"; countdownSec = secondsToStart(now); }
     }
     else {
+      
       if (!inWindowPrev){ cyclePhase = PHASE_SPRAY; phaseStart = millis(); }
       unsigned long elapsed = millis() - phaseStart;
       unsigned long sprayMs = (unsigned long)cfg.sprayDurationSec * 1000UL;
@@ -196,8 +180,7 @@ String buildStatusJson(){
   j += "\"endHour\":"          + String(cfg.endHour) + ",";
   j += "\"endMinute\":"        + String(cfg.endMinute) + ",";
   j += "\"sprayDurationSec\":" + String(cfg.sprayDurationSec) + ",";
-  j += "\"restDurationSec\":"  + String(cfg.restDurationSec) + ",";
-  j += "\"autoEnabled\":"      + String(cfg.autoEnabled?"true":"false");
+  j += "\"restDurationSec\":"  + String(cfg.restDurationSec);
   j += "}}";
   return j;
 }
@@ -215,7 +198,7 @@ template<typename T> T clampv(T x, T lo, T hi){ return x<lo?lo:(x>hi?hi:x); }
 
 void setupServer(){
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
-    req->send_P(200, "text/html", index_html);
+    req->send(200, "text/html", index_html);
   });
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req){
@@ -232,7 +215,6 @@ void setupServer(){
   });
 
   server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *req){
-    cfg.autoEnabled      = (argi(req,"autoEnabled", cfg.autoEnabled?1:0) != 0);
     cfg.startHour        = clampv(argi(req,"startHour",   cfg.startHour),   0, 23);
     cfg.startMinute      = clampv(argi(req,"startMinute", cfg.startMinute), 0, 59);
     cfg.endHour          = clampv(argi(req,"endHour",     cfg.endHour),     0, 23);
