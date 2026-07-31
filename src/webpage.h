@@ -98,6 +98,13 @@ const char index_html[] PROGMEM = R"rawliteral(
   .btn-blue{background:var(--blue);color:#fff}
   .btn-blue:active{background:var(--blue-d)}
   .btn.sm{width:120px;padding:10px 0px}
+  .btn-restart{background:#fff;color:var(--rose);border:1px solid var(--rose)}
+  .btn-restart:active{background:#fff1f2}
+
+  .sysbox{display:flex;flex-direction:column;gap:12px}
+  .syspre{margin:0;padding:0;background:transparent;border:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.55;
+    white-space:pre;color:var(--ink)}
 
   .rtcline{display:flex;align-items:center;justify-content:space-between;gap:12px}
   .rtcline .now{font-size:12.5px;color:var(--muted)}
@@ -182,7 +189,20 @@ const char index_html[] PROGMEM = R"rawliteral(
     <button class="btn btn-blue sm" onclick="syncTime()">Sinkron HP</button>
   </div>
 
-  <footer>Sistem Penyiraman Otomatis • ESP32 • v1.0</footer>
+  <!-- STATUS SISTEM -->
+  <div class="card">
+    <div class="sect-h open" id="sysH" onclick="toggleSect('sys')">
+      <h3>Status Sistem</h3><span class="chev">▾</span>
+    </div>
+    <div class="sect-body open" id="sysBody">
+      <div class="sect-inner sysbox">
+        <pre class="syspre" id="sysPre">memuat…</pre>
+        <button class="btn btn-restart" onclick="restartDev()">Restart Perangkat</button>
+      </div>
+    </div>
+  </div>
+
+  <footer>Sistem Penyiraman Otomatis • ESP32 • v1.1</footer>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -247,6 +267,16 @@ function render(d){
     $('sprayM').value=Math.round(s.sprayDurationSec/60);
     $('restM').value=Math.round(s.restDurationSec/60);
   }
+
+  if(d.system){
+    const s=d.system;
+    $('sysPre').textContent=
+      'STATUS SISTEM\n'+
+      'Reset Terakhir : '+s.resetReason+'\n'+
+      'Boot Count     : '+s.bootCount+'\n'+
+      'Uptime         : '+s.uptime+'\n'+
+      'Free Heap      : '+s.freeHeapKB+' KB';
+  }
 }
 
 async function setMode(m){
@@ -276,6 +306,16 @@ async function syncTime(){
   try{await fetch('/api/time',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
     toast('Waktu RTC disinkronkan');poll();
   }catch(e){toast('Gagal sinkron waktu',1);}
+}
+
+async function restartDev(){
+  if(!confirm('Restart perangkat sekarang?'))return;
+  try{
+    await fetch('/api/restart',{method:'POST'});
+    toast('Perangkat dimulai ulang…');
+    $('dot').classList.remove('live');
+    $('connlbl').textContent='Memulai ulang';
+  }catch(e){toast('Gagal restart',1);}
 }
 
 poll();setInterval(poll,1000);

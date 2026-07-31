@@ -4,15 +4,20 @@
 #include <ESPAsyncWebServer.h>
 #include <RTClib.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 #include "webpage.h"
 
-#define PIN_RELAY      26      
-#define PIN_LED        2       
+#define PIN_RELAY      26
+#define PIN_LED        2
 
 #define RELAY_ACTIVE_LOW   true
+#define WDT_TIMEOUT_SEC    30
+#define CYCLE_SAVE_MS      5000UL
+#define WIFI_CHECK_MS      10000UL
 
-const char* AP_SSID = "Automatic Watering";
-const char* AP_PASS = "12345678";        
+const char* AP_SSID = "Automatic Spraying";
+const char* AP_PASS = "12345678";
 
 AsyncWebServer server(80);
 RTC_DS3231 rtc;
@@ -24,8 +29,8 @@ struct Settings {
   uint8_t  startMinute     = 0;
   uint8_t  endHour         = 14;
   uint8_t  endMinute       = 0;
-  uint16_t sprayDurationSec= 900;   
-  uint16_t restDurationSec = 900;   
+  uint16_t sprayDurationSec= 900;
+  uint16_t restDurationSec = 900;
 } cfg;
 
 enum ManualMode { MODE_AUTO, MODE_MAN_ON, MODE_MAN_OFF };
@@ -37,8 +42,48 @@ unsigned long phaseStart = 0;
 bool inWindowPrev = false;
 bool pumpOn = false;
 String stateLabel = "DI LUAR JADWAL";
+bool cycleRestored = false;
 
-String lastWaterTime = "";   
+String lastWaterTime = "";
+uint32_t bootCount = 0;
+
+const char* resetReasonStr(){
+  switch (esp_reset_reason()){
+    case ESP_RST_POWERON:   return "Power On";
+    case ESP_RST_EXT:       return "External Reset";
+    case ESP_RST_SW:        return "Software Reset";
+    case ESP_RST_PANIC:     return "Panic";
+    case ESP_RST_INT_WDT:   return "Int Watchdog";
+    case ESP_RST_TASK_WDT:  return "Task Watchdog";
+    case ESP_RST_WDT:       return "Watchdog";
+    case ESP_RST_DEEPSLEEP: return "Deep Sleep";
+    case ESP_RST_BROWNOUT:  return "Brownout";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "Unknown";
+  }
+}
+
+void initBootCount(){
+  prefs.begin("sysinfo", false);
+  bootCount = prefs.getUInt("bootCount", 0) + 1;
+  prefs.putUInt("bootCount", bootCount);
+  prefs.end();
+}
+
+String formatUptime(){
+  unsigned long sec = millis() / 1000UL;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+           sec / 3600UL, (sec % 3600UL) / 60UL, sec % 60UL);
+  return String(buf);
+}
+
+void printSystemStatus(){
+  Serial.printf("Reset Terakhir : %s\n", resetReasonStr());
+  Serial.printf("Boot Count     : %lu\n", (unsigned long)bootCount);
+  Serial.printf("Uptime         : %s\n", formatUptime().c_str());
+  Serial.printf("Free Heap      : %u KB\n", ESP.getFreeHeap() / 1024);
+}
 
 void loadSettings(){
   prefs.begin("siram", true);
@@ -77,8 +122,60 @@ void recordWaterEnd(){
   DateTime n = rtc.now();
   char b[8];
   snprintf(b, sizeof(b), "%02d.%02d", n.hour(), n.minute());
-  lastWaterTime = String(b);     
+  lastWaterTime = String(b);
   saveLastWater();
+}
+
+void saveManualMode(){
+  prefs.begin("siram", false);
+  prefs.putUChar("mode", (uint8_t)manualMode);
+  prefs.end();
+}
+void loadManualMode(){
+  prefs.begin("siram", true);
+  manualMode = (ManualMode)prefs.getUChar("mode", MODE_AUTO);
+  prefs.end();
+}
+
+// Simpan fase + sisa detik agar setelah brownout/restart bisa dilanjutkan
+void saveCycleState(uint32_t remainSec){
+  prefs.begin("siram", false);
+  prefs.putBool("cycOk", true);
+  prefs.putUChar("cycPh", (uint8_t)cyclePhase);
+  prefs.putUInt("cycRem", remainSec);
+  prefs.end();
+}
+void clearCycleState(){
+  prefs.begin("siram", true);
+  bool ok = prefs.getBool("cycOk", false);
+  prefs.end();
+  if (!ok) return;
+  prefs.begin("siram", false);
+  prefs.putBool("cycOk", false);
+  prefs.putUInt("cycRem", 0);
+  prefs.end();
+}
+void loadCycleState(){
+  prefs.begin("siram", true);
+  bool ok = prefs.getBool("cycOk", false);
+  uint8_t ph = prefs.getUChar("cycPh", PHASE_SPRAY);
+  uint32_t rem = prefs.getUInt("cycRem", 0);
+  prefs.end();
+
+  if (!ok || rem == 0) return;
+
+  cyclePhase = (ph == PHASE_REST) ? PHASE_REST : PHASE_SPRAY;
+  uint32_t dur = (cyclePhase == PHASE_SPRAY) ? cfg.sprayDurationSec : cfg.restDurationSec;
+  if (rem > dur) rem = dur;
+
+  // phaseStart diset seolah fase sudah berjalan (dur - rem) detik
+  unsigned long elapsedMs = (unsigned long)(dur - rem) * 1000UL;
+  phaseStart = millis() - elapsedMs;
+  inWindowPrev = true;
+  cycleRestored = true;
+  Serial.printf("Siklus dilanjutkan: fase=%s sisa=%lus\n",
+                cyclePhase == PHASE_SPRAY ? "SIRAM" : "ISTIRAHAT",
+                (unsigned long)rem);
 }
 
 void setPump(bool on){
@@ -86,7 +183,21 @@ void setPump(bool on){
   pumpOn = on;
   digitalWrite(PIN_RELAY, (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
   digitalWrite(PIN_LED, on ? HIGH : LOW);
-  if (!on && prev) recordWaterEnd();      
+  if (!on && prev) recordWaterEnd();
+}
+
+void ensureSoftAP(){
+  wifi_mode_t mode = WiFi.getMode();
+  bool apUp = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
+  // softAPIP 0.0.0.0 = AP mati / modem hang
+  if (!apUp || WiFi.softAPIP() == IPAddress(0, 0, 0, 0)){
+    Serial.println("SoftAP down — menyalakan ulang...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    WiFi.setSleep(false);
+    Serial.print("AP aktif kembali: http://");
+    Serial.println(WiFi.softAPIP());
+  }
 }
 
 int minutesOfDay(int h,int m){ return h*60+m; }
@@ -95,9 +206,9 @@ bool isWithinWindow(const DateTime& now){
   int s = minutesOfDay(cfg.startHour, cfg.startMinute);
   int e = minutesOfDay(cfg.endHour,   cfg.endMinute);
   int n = minutesOfDay(now.hour(),    now.minute());
-  if (s == e) return false;              
-  if (s <  e) return (n >= s && n < e);  
-  return (n >= s || n < e);              
+  if (s == e) return false;
+  if (s <  e) return (n >= s && n < e);
+  return (n >= s || n < e);
 }
 
 long countdownSec = 0;
@@ -112,27 +223,42 @@ void updateLogic(){
 
   if (manualMode == MODE_MAN_ON){
     desired = true;  stateLabel = "MANUAL ON";
+    clearCycleState();
   }
   else if (manualMode == MODE_MAN_OFF){
     desired = false; stateLabel = "MANUAL OFF";
+    clearCycleState();
   }
-  else { 
+  else {
     if (!inWindow){
       desired = false; stateLabel = "DI LUAR JADWAL";
+      clearCycleState();
     }
     else {
-      
-      if (!inWindowPrev){ cyclePhase = PHASE_SPRAY; phaseStart = millis(); }
-      unsigned long elapsed = millis() - phaseStart;
+      // Masuk jendela baru: mulai siram, kecuali baru restore dari NVS
+      if (!inWindowPrev && !cycleRestored){
+        cyclePhase = PHASE_SPRAY;
+        phaseStart = millis();
+      }
+      cycleRestored = false;
+
       unsigned long sprayMs = (unsigned long)cfg.sprayDurationSec * 1000UL;
       unsigned long restMs  = (unsigned long)cfg.restDurationSec  * 1000UL;
+      unsigned long elapsed = millis() - phaseStart;
+      bool phaseChanged = false;
 
       if (cyclePhase == PHASE_SPRAY){
-        if (sprayMs == 0){ cyclePhase = PHASE_REST; phaseStart = millis(); }
-        else if (elapsed >= sprayMs){ cyclePhase = PHASE_REST; phaseStart = millis(); }
+        if (sprayMs == 0 || elapsed >= sprayMs){
+          cyclePhase = PHASE_REST;
+          phaseStart = millis();
+          phaseChanged = true;
+        }
       } else {
-        if (restMs == 0){ cyclePhase = PHASE_SPRAY; phaseStart = millis(); }
-        else if (elapsed >= restMs){ cyclePhase = PHASE_SPRAY; phaseStart = millis(); }
+        if (restMs == 0 || elapsed >= restMs){
+          cyclePhase = PHASE_SPRAY;
+          phaseStart = millis();
+          phaseChanged = true;
+        }
       }
 
       if (cyclePhase == PHASE_SPRAY){
@@ -143,6 +269,14 @@ void updateLogic(){
         desired = false; stateLabel = "ISTIRAHAT";
         countdownLabel = "Sisa istirahat";
         countdownSec = (long)((restMs - (millis()-phaseStart)) / 1000UL);
+      }
+      if (countdownSec < 0) countdownSec = 0;
+
+      // Simpan berkala + saat ganti fase (untuk resume setelah reset)
+      static unsigned long lastSave = 0;
+      if (phaseChanged || millis() - lastSave >= CYCLE_SAVE_MS){
+        lastSave = millis();
+        saveCycleState((uint32_t)countdownSec);
       }
     }
   }
@@ -181,13 +315,19 @@ String buildStatusJson(){
   j += "\"endMinute\":"        + String(cfg.endMinute) + ",";
   j += "\"sprayDurationSec\":" + String(cfg.sprayDurationSec) + ",";
   j += "\"restDurationSec\":"  + String(cfg.restDurationSec);
+  j += "},";
+  j += "\"system\":{";
+  j += "\"resetReason\":\"" + String(resetReasonStr()) + "\",";
+  j += "\"bootCount\":" + String(bootCount) + ",";
+  j += "\"uptime\":\"" + formatUptime() + "\",";
+  j += "\"freeHeapKB\":" + String(ESP.getFreeHeap() / 1024);
   j += "}}";
   return j;
 }
 
 String argv(AsyncWebServerRequest* r, const char* name, const String& def=""){
-  if (r->hasParam(name, true))  return r->getParam(name, true)->value();   
-  if (r->hasParam(name, false)) return r->getParam(name, false)->value();  
+  if (r->hasParam(name, true))  return r->getParam(name, true)->value();
+  if (r->hasParam(name, false)) return r->getParam(name, false)->value();
   return def;
 }
 int argi(AsyncWebServerRequest* r, const char* name, int def){
@@ -210,6 +350,7 @@ void setupServer(){
     if (m=="on")   manualMode = MODE_MAN_ON;
     else if (m=="off")  manualMode = MODE_MAN_OFF;
     else if (m=="auto") manualMode = MODE_AUTO;
+    saveManualMode();
     updateLogic();
     req->send(200, "application/json", "{\"ok\":true}");
   });
@@ -222,8 +363,10 @@ void setupServer(){
     cfg.sprayDurationSec = clampv(argi(req,"sprayDurationSec", cfg.sprayDurationSec), 0, 64800);
     cfg.restDurationSec  = clampv(argi(req,"restDurationSec",  cfg.restDurationSec),  0, 64800);
     saveSettings();
-    phaseStart = millis();          
+    phaseStart = millis();
     inWindowPrev = false;
+    cycleRestored = false;
+    clearCycleState();
     updateLogic();
     req->send(200, "application/json", "{\"ok\":true}");
   });
@@ -235,6 +378,16 @@ void setupServer(){
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
+  server.on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *req){
+    if (countdownSec > 0 && manualMode == MODE_AUTO)
+      saveCycleState((uint32_t)countdownSec);
+    req->send(200, "application/json", "{\"ok\":true}");
+    req->onDisconnect([](){
+      delay(100);
+      ESP.restart();
+    });
+  });
+
   server.onNotFound([](AsyncWebServerRequest *req){ req->send(404, "text/plain", "404"); });
   server.begin();
 }
@@ -243,10 +396,17 @@ void setup(){
   Serial.begin(115200);
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_LED,   OUTPUT);
-  setPump(false);                       
+  setPump(false);
+
+  initBootCount();
+
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+  esp_task_wdt_add(NULL);
 
   loadSettings();
   loadLastWater();
+  loadManualMode();
+  loadCycleState();
 
   if (rtc.begin()){
     rtcOk = true;
@@ -259,16 +419,26 @@ void setup(){
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.setSleep(false);
   Serial.print("AP aktif. Buka http://");
-  Serial.println(WiFi.softAPIP());      
+  Serial.println(WiFi.softAPIP());
 
   setupServer();
+  printSystemStatus();
 }
 
 void loop(){
-  static unsigned long t = 0;
-  if (millis() - t >= 250){            
-    t = millis();
+  esp_task_wdt_reset();
+
+  static unsigned long tLogic = 0;
+  if (millis() - tLogic >= 250){
+    tLogic = millis();
     updateLogic();
+  }
+
+  static unsigned long tWifi = 0;
+  if (millis() - tWifi >= WIFI_CHECK_MS){
+    tWifi = millis();
+    ensureSoftAP();
   }
 }
