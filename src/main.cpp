@@ -4,8 +4,10 @@
 #include <ESPAsyncWebServer.h>
 #include <RTClib.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <driver/gpio.h>
 #include "webpage.h"
 
 #define PIN_RELAY      26
@@ -15,6 +17,8 @@
 #define WDT_TIMEOUT_SEC    30
 #define CYCLE_SAVE_MS      5000UL
 #define WIFI_CHECK_MS      10000UL
+#define LOG_PATH           "/siram_log.csv"
+#define LOG_MIN_FREE       8192UL
 
 const char* AP_SSID = "Automatic Spraying";
 const char* AP_PASS = "12345678";
@@ -46,6 +50,34 @@ bool cycleRestored = false;
 
 String lastWaterTime = "";
 uint32_t bootCount = 0;
+bool fsOk = false;
+
+String modeStr();
+bool initFS();
+size_t logFileSize();
+void appendLog(const char* event);
+void appendLog(const char* event, const char* status);
+void clearLogFile();
+void getStorageJson(String& out);
+void savePumpFlag(bool on);
+bool loadPumpFlag();
+void logBootEvents(bool wasPumpOn);
+void relaySafeOff();
+
+// Matikan relay secepat mungkin (active-low: HIGH = OFF)
+void relaySafeOff(){
+  gpio_config_t io = {};
+  io.pin_bit_mask = (1ULL << PIN_RELAY);
+  io.mode = GPIO_MODE_OUTPUT;
+  io.pull_up_en = GPIO_PULLUP_ENABLE;
+  io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io.intr_type = GPIO_INTR_DISABLE;
+  gpio_config(&io);
+  gpio_set_level((gpio_num_t)PIN_RELAY, RELAY_ACTIVE_LOW ? 1 : 0);
+
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+}
 
 const char* resetReasonStr(){
   switch (esp_reset_reason()){
@@ -126,6 +158,114 @@ void recordWaterEnd(){
   saveLastWater();
 }
 
+bool initFS(){
+  if (!LittleFS.begin(true)){
+    Serial.println("LittleFS gagal dimuat.");
+    return false;
+  }
+  if (!LittleFS.exists(LOG_PATH)){
+    File f = LittleFS.open(LOG_PATH, "w");
+    if (f){
+      f.println("tanggal,waktu,event,mode,status");
+      f.close();
+    }
+  }
+  return true;
+}
+
+size_t logFileSize(){
+  if (!fsOk || !LittleFS.exists(LOG_PATH)) return 0;
+  File f = LittleFS.open(LOG_PATH, "r");
+  if (!f) return 0;
+  size_t sz = f.size();
+  f.close();
+  return sz;
+}
+
+void clearLogFile(){
+  if (!fsOk) return;
+  File f = LittleFS.open(LOG_PATH, "w");
+  if (f){
+    f.println("tanggal,waktu,event,mode,status");
+    f.close();
+  }
+}
+
+void appendLog(const char* event){
+  appendLog(event, stateLabel.c_str());
+}
+
+void appendLog(const char* event, const char* status){
+  if (!fsOk) return;
+  size_t total = LittleFS.totalBytes();
+  size_t used  = LittleFS.usedBytes();
+  if (total < used || (total - used) < LOG_MIN_FREE) return;
+
+  char date[12], tim[12];
+  if (rtcOk){
+    DateTime n = rtc.now();
+    if (n.month() < 1 || n.month() > 12){
+      snprintf(date, sizeof(date), "----/--/--");
+      snprintf(tim, sizeof(tim), "--:--:--");
+    } else {
+      snprintf(date, sizeof(date), "%04d-%02d-%02d", n.year(), n.month(), n.day());
+      snprintf(tim, sizeof(tim), "%02d:%02d:%02d", n.hour(), n.minute(), n.second());
+    }
+  } else {
+    unsigned long sec = millis() / 1000UL;
+    snprintf(date, sizeof(date), "uptime");
+    snprintf(tim, sizeof(tim), "%02lu:%02lu:%02lu",
+             sec / 3600UL, (sec % 3600UL) / 60UL, sec % 60UL);
+  }
+
+  File f = LittleFS.open(LOG_PATH, "a");
+  if (!f) return;
+  f.printf("%s,%s,%s,%s,%s\n", date, tim, event, modeStr().c_str(), status);
+  f.close();
+}
+
+void savePumpFlag(bool on){
+  prefs.begin("siram", false);
+  prefs.putBool("pumpOn", on);
+  prefs.end();
+}
+
+bool loadPumpFlag(){
+  prefs.begin("siram", true);
+  bool v = prefs.getBool("pumpOn", false);
+  prefs.end();
+  return v;
+}
+
+void logBootEvents(bool wasPumpOn){
+  if (!fsOk) return;
+  const char* reason = resetReasonStr();
+  if (wasPumpOn){
+    appendLog("INTERRUPT", reason);
+    savePumpFlag(false);
+  }
+  appendLog("BOOT", reason);
+}
+
+void getStorageJson(String& out){
+  size_t total = 0, used = 0, freeb = 0, logSz = 0;
+  if (fsOk){
+    total = LittleFS.totalBytes();
+    used  = LittleFS.usedBytes();
+    freeb = (total > used) ? (total - used) : 0;
+    logSz = logFileSize();
+  }
+  out = "{";
+  out += "\"fsOk\":" + String(fsOk ? "true" : "false") + ",";
+  out += "\"totalKB\":" + String(total / 1024) + ",";
+  out += "\"usedKB\":" + String(used / 1024) + ",";
+  out += "\"freeKB\":" + String(freeb / 1024) + ",";
+  out += "\"freeBytes\":" + String((unsigned long)freeb) + ",";
+  out += "\"logBytes\":" + String((unsigned long)logSz) + ",";
+  out += "\"logKB\":" + String(logSz / 1024);
+  out += "}";
+}
+
 void saveManualMode(){
   prefs.begin("siram", false);
   prefs.putUChar("mode", (uint8_t)manualMode);
@@ -180,10 +320,22 @@ void loadCycleState(){
 
 void setPump(bool on){
   bool prev = pumpOn;
+  if (on == prev){
+    digitalWrite(PIN_RELAY, (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
+    digitalWrite(PIN_LED, on ? HIGH : LOW);
+    return;
+  }
+
   pumpOn = on;
   digitalWrite(PIN_RELAY, (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
   digitalWrite(PIN_LED, on ? HIGH : LOW);
-  if (!on && prev) recordWaterEnd();
+  savePumpFlag(on);
+
+  if (on) appendLog("ON");
+  else {
+    recordWaterEnd();
+    appendLog("OFF");
+  }
 }
 
 void ensureSoftAP(){
@@ -321,7 +473,11 @@ String buildStatusJson(){
   j += "\"bootCount\":" + String(bootCount) + ",";
   j += "\"uptime\":\"" + formatUptime() + "\",";
   j += "\"freeHeapKB\":" + String(ESP.getFreeHeap() / 1024);
-  j += "}}";
+  j += "},";
+  String stor;
+  getStorageJson(stor);
+  j += "\"storage\":" + stor;
+  j += "}";
   return j;
 }
 
@@ -388,15 +544,33 @@ void setupServer(){
     });
   });
 
+  server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req){
+    if (!fsOk || !LittleFS.exists(LOG_PATH)){
+      req->send(404, "text/plain", "Log tidak tersedia");
+      return;
+    }
+    req->send(LittleFS, LOG_PATH, "text/csv", true);
+  });
+
+  server.on("/api/export/clear", HTTP_POST, [](AsyncWebServerRequest *req){
+    clearLogFile();
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
   server.onNotFound([](AsyncWebServerRequest *req){ req->send(404, "text/plain", "404"); });
   server.begin();
 }
 
 void setup(){
+  // WAJIB paling awal: cegah relay active-low nyala saat GPIO masih float
+  relaySafeOff();
+  pumpOn = false;
+
   Serial.begin(115200);
-  pinMode(PIN_RELAY, OUTPUT);
-  pinMode(PIN_LED,   OUTPUT);
-  setPump(false);
+
+  // Baca flag pompa SEBELUM setPump, agar INTERRUPT bisa dicatat
+  bool wasPumpOn = loadPumpFlag();
+  relaySafeOff();  // pastikan tetap OFF setelah baca NVS
 
   initBootCount();
 
@@ -408,6 +582,10 @@ void setup(){
   loadManualMode();
   loadCycleState();
 
+  fsOk = initFS();
+  if (fsOk) Serial.printf("LittleFS OK. Sisa %u KB\n",
+                          (unsigned)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024));
+
   if (rtc.begin()){
     rtcOk = true;
     if (rtc.lostPower()){
@@ -416,6 +594,9 @@ void setup(){
   } else {
     Serial.println("RTC DS3231 tidak terdeteksi! Cek wiring I2C.");
   }
+
+  // Setelah FS + RTC siap: tutup sesi terputus lalu catat boot
+  logBootEvents(wasPumpOn);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);

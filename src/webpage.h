@@ -72,7 +72,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   .chev{color:var(--muted);transition:.25s;font-size:13px}
   .sect-h.open .chev{transform:rotate(180deg)}
   .sect-body{max-height:0;overflow:hidden;transition:max-height .3s ease}
-  .sect-body.open{max-height:600px}
+  .sect-body.open{max-height:720px}
   .sect-inner{padding-top:14px;display:flex;flex-direction:column;gap:12px}
   .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
   .row label{font-size:13.5px}
@@ -100,6 +100,12 @@ const char index_html[] PROGMEM = R"rawliteral(
   .btn.sm{width:120px;padding:10px 0px}
   .btn-restart{background:#fff;color:var(--rose);border:1px solid var(--rose)}
   .btn-restart:active{background:#fff1f2}
+  .btn-ghost{background:#f8fafc;color:var(--ink);border:1px solid var(--line)}
+  .btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .storow{display:flex;justify-content:space-between;font-size:13px;color:var(--ink)}
+  .storow .muted{color:var(--muted);font-size:12px}
+  .bar{height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin-top:2px}
+  .bar>i{display:block;height:100%;background:var(--water);border-radius:999px;width:0%;transition:width .3s}
 
   .sysbox{display:flex;flex-direction:column;gap:12px}
   .syspre{margin:0;padding:0;background:transparent;border:none;
@@ -202,7 +208,29 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <footer>Sistem Penyiraman Otomatis • ESP32 • v1.1</footer>
+  <!-- EKSPOR DATA -->
+  <div class="card">
+    <div class="sect-h open" id="expH" onclick="toggleSect('exp')">
+      <h3>Ekspor Data</h3><span class="chev">▾</span>
+    </div>
+    <div class="sect-body open" id="expBody">
+      <div class="sect-inner">
+        <div>
+          <div class="storow"><span>Sisa penyimpanan</span><b id="storFree">—</b></div>
+          <div class="storow muted" style="margin-top:4px"><span>Terpakai / Total</span><span id="storUsed">—</span></div>
+          <div class="bar"><i id="storBar"></i></div>
+        </div>
+        <div class="storow"><span>Ukuran file CSV</span><b id="storLog">—</b></div>
+        <div class="hint">Log ON/OFF otomatis. Jika restart saat pompa ON: INTERRUPT + BOOT (dengan alasan reset).</div>
+        <div class="btn-row">
+          <button class="btn btn-blue" onclick="downloadCsv()">Unduh CSV</button>
+          <button class="btn btn-ghost" onclick="clearCsv()">Hapus Log</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Sistem Penyiraman Otomatis • ESP32 • v1.2</footer>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -277,6 +305,46 @@ function render(d){
       'Uptime         : '+s.uptime+'\n'+
       'Free Heap      : '+s.freeHeapKB+' KB';
   }
+
+  if(d.storage){
+    const st=d.storage;
+    if(!st.fsOk){
+      $('storFree').textContent='FS error';
+      $('storUsed').textContent='—';
+      $('storLog').textContent='—';
+      $('storBar').style.width='0%';
+    }else{
+      const freeLabel=st.freeKB>0?(st.freeKB+' KB'):(st.freeBytes+' B');
+      $('storFree').textContent=freeLabel;
+      $('storUsed').textContent=st.usedKB+' / '+st.totalKB+' KB';
+      const logLabel=st.logKB>0?(st.logKB+' KB'):(st.logBytes+' B');
+      $('storLog').textContent=logLabel;
+      const pct=st.totalKB?Math.min(100,Math.round(st.usedKB*100/st.totalKB)):0;
+      $('storBar').style.width=pct+'%';
+    }
+  }
+}
+
+async function downloadCsv(){
+  try{
+    const r=await fetch('/api/export',{cache:'no-store'});
+    if(!r.ok){toast('Log belum tersedia',1);return;}
+    const blob=await r.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='siram_log.csv';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(a.href);
+    toast('CSV diunduh');
+  }catch(e){toast('Gagal unduh CSV',1);}
+}
+
+async function clearCsv(){
+  if(!confirm('Hapus seluruh log CSV?'))return;
+  try{
+    await fetch('/api/export/clear',{method:'POST'});
+    toast('Log dikosongkan');poll();
+  }catch(e){toast('Gagal hapus log',1);}
 }
 
 async function setMode(m){
